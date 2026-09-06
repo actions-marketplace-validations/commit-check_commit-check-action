@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Required for merge-base checks
+          fetch-depth: 0  # With a shallow clone only HEAD, the merge commit, is checked
       - uses: commit-check/commit-check-action@v2
         with:
           message: true
@@ -116,7 +116,8 @@ jobs:
 
 ### `dry-run`
 
-- **Description**: run checks without failing. exit code is 0; otherwise is 1.
+- **Description**: report failures (job summary, PR comment, and annotations
+  downgraded to warnings) but always exit 0, so the job never fails.
 - Default: `false`
 
 ### `job-summary`

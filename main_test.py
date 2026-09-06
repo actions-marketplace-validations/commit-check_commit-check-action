@@ -1,8 +1,10 @@
 """Unit tests for main.py."""
 
+import importlib.metadata
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -391,9 +393,26 @@ class TestGetPrCommitMessages(unittest.TestCase):
             result = main.get_pr_commit_messages()
         self.assertEqual(result, [])
 
-    def test_merge_ref_is_preferred(self):
+    def test_event_range_is_preferred(self):
         with (
             patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch(
+                "main.get_messages_from_event_range",
+                return_value=["fix: first", "feat: second"],
+            ) as mock_range,
+            patch("main.get_messages_from_merge_ref") as mock_merge,
+            patch("main.get_messages_from_head_ref") as mock_head,
+        ):
+            result = main.get_pr_commit_messages()
+        self.assertEqual(result, ["fix: first", "feat: second"])
+        mock_range.assert_called_once()
+        mock_merge.assert_not_called()
+        mock_head.assert_not_called()
+
+    def test_merge_ref_is_next(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.get_messages_from_event_range", return_value=[]),
             patch(
                 "main.get_messages_from_merge_ref",
                 return_value=["fix: first", "feat: second"],
@@ -408,7 +427,7 @@ class TestGetPrCommitMessages(unittest.TestCase):
     def test_pull_request_target_is_supported(self):
         with (
             patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}),
-            patch("main.get_messages_from_merge_ref", return_value=["fix: first"]),
+            patch("main.get_messages_from_event_range", return_value=["fix: first"]),
         ):
             result = main.get_pr_commit_messages()
         self.assertEqual(result, ["fix: first"])
@@ -422,6 +441,7 @@ class TestGetPrCommitMessages(unittest.TestCase):
                     "GITHUB_BASE_REF": "main",
                 },
             ),
+            patch("main.get_messages_from_event_range", return_value=[]),
             patch("main.get_messages_from_merge_ref", return_value=[]),
             patch(
                 "main.get_messages_from_head_ref",
@@ -436,7 +456,8 @@ class TestGetPrCommitMessages(unittest.TestCase):
         with (
             patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
             patch(
-                "main.get_messages_from_merge_ref", side_effect=Exception("git failed")
+                "main.get_messages_from_event_range",
+                side_effect=Exception("git failed"),
             ),
         ):
             result = main.get_pr_commit_messages()
@@ -448,13 +469,67 @@ class TestGitMessageReaders(unittest.TestCase):
         mock_result = MagicMock(
             returncode=0, stdout="fix: first\n\x00feat: second\n\x00"
         )
-        with patch("main.subprocess.run", return_value=mock_result) as mock_run:
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.subprocess.run", return_value=mock_result) as mock_run,
+        ):
             result = main.get_messages_from_merge_ref()
         self.assertEqual(result, ["fix: first", "feat: second"])
         self.assertEqual(
             mock_run.call_args[0][0],
             ["git", "log", "--pretty=format:%B%x00", "--reverse", "HEAD^1..HEAD^2"],
         )
+
+    def test_merge_ref_is_never_read_on_pull_request_target(self):
+        """HEAD is the base branch there; HEAD^2 belongs to some other merge."""
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}),
+            patch("main.subprocess.run") as mock_run,
+        ):
+            self.assertEqual(main.get_messages_from_merge_ref(), [])
+        mock_run.assert_not_called()
+
+    def test_get_messages_from_event_range(self):
+        commands: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            if command[:2] == ["git", "rev-parse"]:
+                return MagicMock(returncode=0, stdout="x\n")
+            return MagicMock(returncode=0, stdout="fix: first\n\x00feat: second\n\x00")
+
+        with (
+            patch("main.get_pr_base_sha", return_value="base111"),
+            patch("main.get_pr_head_sha", return_value="head222"),
+            patch("main.subprocess.run", side_effect=run),
+        ):
+            result = main.get_messages_from_event_range()
+        self.assertEqual(result, ["fix: first", "feat: second"])
+        self.assertIn(
+            ["git", "log", "--pretty=format:%B%x00", "--reverse", "base111..head222"],
+            commands,
+        )
+
+    def test_event_range_needs_both_commits_in_the_clone(self):
+        with (
+            patch("main.get_pr_base_sha", return_value="base111"),
+            patch("main.get_pr_head_sha", return_value="head222"),
+            patch("main.subprocess.run", return_value=MagicMock(returncode=1)),
+        ):
+            self.assertEqual(main.get_messages_from_event_range(), [])
+
+    def test_event_range_without_a_payload_is_empty(self):
+        with (
+            patch("main.get_pr_base_sha", return_value=None),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch("main.subprocess.run") as mock_run,
+        ):
+            self.assertEqual(main.get_messages_from_event_range(), [])
+        mock_run.assert_not_called()
+
+    def test_a_failing_git_log_yields_no_messages(self):
+        with patch("main.subprocess.run", return_value=MagicMock(returncode=128)):
+            self.assertEqual(main.get_messages_from_head_ref("main"), [])
 
     def test_get_messages_from_head_ref(self):
         mock_result = MagicMock(returncode=0, stdout="fix: first\n\x00")
@@ -574,7 +649,7 @@ class TestRunCommitCheck(unittest.TestCase):
     def test_message_flag_removed_before_other_checks_in_pr(self):
         captured_args = []
 
-        def fake_other_checks(args):
+        def fake_other_checks(args, rev=None):
             captured_args.extend(args)
             return []
 
@@ -590,6 +665,380 @@ class TestRunCommitCheck(unittest.TestCase):
             main.run_commit_check()
         self.assertNotIn("--message", captured_args)
         self.assertIn("--branch", captured_args)
+
+    SHALLOW_PR_WARNING = (
+        "::warning title=commit-check::Could not list the pull request's commits "
+        "(is actions/checkout using fetch-depth: 0?); only HEAD was checked"
+    )
+
+    def _run_capturing_stdout(self):
+        buffer = io.StringIO()
+        with patch("sys.stdout", buffer):
+            rc, results = main.run_commit_check()
+        return rc, results, buffer.getvalue()
+
+    def test_pr_without_enumerable_commits_warns_and_checks_head(self):
+        """A shallow clone must not turn a pull request green silently.
+
+        With fetch-depth: 1 neither HEAD^1..HEAD^2 nor origin/<base>..HEAD
+        can be listed, and the fallback validates HEAD — the synthetic
+        "Merge X into Y" commit, which passes CC001 by default.
+        """
+        with (
+            patch("main.MESSAGE_ENABLED", True),
+            patch("main.BRANCH_ENABLED", False),
+            patch("main.AUTHOR_NAME_ENABLED", False),
+            patch("main.AUTHOR_EMAIL_ENABLED", False),
+            patch("main.is_pr_event", return_value=True),
+            patch("main.get_pr_commit_messages", return_value=[]),
+            patch(
+                "main.check_scope", return_value=pass_scope("Commit message")
+            ) as mock_scope,
+            patch("main.run_other_checks", return_value=[]),
+        ):
+            rc, results, output = self._run_capturing_stdout()
+        self.assertEqual(rc, 0)
+        self.assertIn(self.SHALLOW_PR_WARNING, output)
+        mock_scope.assert_called_once_with("Commit message", ["--message"])
+
+    def test_push_without_pr_commits_does_not_warn(self):
+        with (
+            patch("main.MESSAGE_ENABLED", True),
+            patch("main.BRANCH_ENABLED", False),
+            patch("main.AUTHOR_NAME_ENABLED", False),
+            patch("main.AUTHOR_EMAIL_ENABLED", False),
+            patch("main.is_pr_event", return_value=False),
+            patch("main.get_pr_commit_messages", return_value=[]),
+            patch("main.check_scope", return_value=pass_scope("Commit message")),
+            patch("main.run_other_checks", return_value=[]),
+        ):
+            _rc, _results, output = self._run_capturing_stdout()
+        self.assertNotIn("::warning", output)
+
+    @staticmethod
+    def _fake_git_and_cli(resolves: bool):
+        """subprocess.run stand-in: answers rev-parse and the CLI alike."""
+        commands: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            if command[:2] == ["git", "rev-parse"]:
+                return MagicMock(
+                    returncode=0 if resolves else 1,
+                    stdout="abc123\n" if resolves else "",
+                )
+            check = command[3].lstrip("-").replace("-", "_")
+            return MagicMock(returncode=0, stdout=json_output(make_check(check)))
+
+        return run, commands
+
+    def test_pr_author_checks_read_the_branch_tip(self):
+        """On refs/pull/N/merge HEAD's author is GitHub, not the contributor."""
+        run, commands = self._fake_git_and_cli(resolves=True)
+        with (
+            patch("main.MESSAGE_ENABLED", False),
+            patch("main.BRANCH_ENABLED", True),
+            patch("main.AUTHOR_NAME_ENABLED", True),
+            patch("main.AUTHOR_EMAIL_ENABLED", True),
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch("main.subprocess.run", side_effect=run),
+        ):
+            rc, results, output = self._run_capturing_stdout()
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [s.label for s in results], ["Branch", "Author name", "Author email"]
+        )
+        self.assertIn(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD^2^{commit}"], commands
+        )
+        self.assertIn(
+            ["commit-check", "--format", "json", "--author-name", "--rev", "HEAD^2"],
+            commands,
+        )
+        self.assertIn(
+            ["commit-check", "--format", "json", "--author-email", "--rev", "HEAD^2"],
+            commands,
+        )
+        # The branch check has no commit to point at.
+        self.assertIn(["commit-check", "--format", "json", "--branch"], commands)
+        self.assertNotIn("::warning", output)
+
+    def test_pr_author_checks_prefer_the_payload_head_sha(self):
+        """pull_request.head.sha names the tip for either PR event type."""
+        run, commands = self._fake_git_and_cli(resolves=True)
+        with (
+            patch("main.MESSAGE_ENABLED", False),
+            patch("main.BRANCH_ENABLED", False),
+            patch("main.AUTHOR_NAME_ENABLED", True),
+            patch("main.AUTHOR_EMAIL_ENABLED", False),
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}),
+            patch("main.get_pr_head_sha", return_value="deadbeefcafe"),
+            patch("main.subprocess.run", side_effect=run),
+        ):
+            rc, results, output = self._run_capturing_stdout()
+        self.assertEqual(rc, 0)
+        self.assertEqual([s.status for s in results], ["pass"])
+        self.assertIn(
+            ["git", "rev-parse", "--verify", "--quiet", "deadbeefcafe^{commit}"],
+            commands,
+        )
+        self.assertIn(
+            [
+                "commit-check",
+                "--format",
+                "json",
+                "--author-name",
+                "--rev",
+                "deadbeefcafe",
+            ],
+            commands,
+        )
+        self.assertNotIn("::warning", output)
+
+    def test_pr_author_checks_are_skipped_on_a_shallow_clone(self):
+        """HEAD's author is GitHub's merge commit: skip rather than grade it."""
+        run, commands = self._fake_git_and_cli(resolves=False)
+        with (
+            patch("main.MESSAGE_ENABLED", False),
+            patch("main.BRANCH_ENABLED", True),
+            patch("main.AUTHOR_NAME_ENABLED", True),
+            patch("main.AUTHOR_EMAIL_ENABLED", True),
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch("main.subprocess.run", side_effect=run),
+        ):
+            rc, results, output = self._run_capturing_stdout()
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [(s.label, s.status) for s in results],
+            [("Author name", "skip"), ("Author email", "skip"), ("Branch", "pass")],
+        )
+        self.assertEqual(
+            results[0].checks,
+            [
+                {
+                    "rule_id": "CC101",
+                    "check": "author_name",
+                    "status": "skip",
+                    "value": "",
+                    "error": "",
+                    "suggest": "",
+                    "docs_url": "",
+                }
+            ],
+        )
+        self.assertEqual(results[1].checks[0]["rule_id"], "CC102")
+        self.assertFalse([c for c in commands if "--author-name" in c], commands)
+        self.assertFalse([c for c in commands if "--author-email" in c], commands)
+        self.assertIn(["commit-check", "--format", "json", "--branch"], commands)
+        warning = [ln for ln in output.splitlines() if ln.startswith("::warning")]
+        self.assertEqual(len(warning), 1, output)
+        self.assertTrue(warning[0].startswith("::warning title=commit-check::"))
+        self.assertIn("Could not resolve the pull request's head commit", warning[0])
+        self.assertIn("is actions/checkout using fetch-depth: 0?", warning[0])
+        self.assertIn("they were skipped", warning[0])
+
+    def test_pull_request_target_never_uses_head2(self):
+        """On pull_request_target HEAD is the base branch; HEAD^2 is unrelated."""
+        run, commands = self._fake_git_and_cli(resolves=True)
+        with (
+            patch("main.MESSAGE_ENABLED", False),
+            patch("main.BRANCH_ENABLED", False),
+            patch("main.AUTHOR_NAME_ENABLED", True),
+            patch("main.AUTHOR_EMAIL_ENABLED", False),
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch("main.subprocess.run", side_effect=run),
+        ):
+            rc, results, output = self._run_capturing_stdout()
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [(s.label, s.status) for s in results], [("Author name", "skip")]
+        )
+        self.assertFalse([c for c in commands if "HEAD^2^{commit}" in c], commands)
+        self.assertFalse([c for c in commands if c[0] == "commit-check"], commands)
+        self.assertIn("::warning title=commit-check::", output)
+
+    def test_push_author_checks_never_pass_rev(self):
+        run, commands = self._fake_git_and_cli(resolves=True)
+        with (
+            patch("main.MESSAGE_ENABLED", False),
+            patch("main.BRANCH_ENABLED", False),
+            patch("main.AUTHOR_NAME_ENABLED", True),
+            patch("main.AUTHOR_EMAIL_ENABLED", True),
+            patch("main.is_pr_event", return_value=False),
+            patch("main.subprocess.run", side_effect=run),
+        ):
+            _rc, _results, output = self._run_capturing_stdout()
+        self.assertFalse([c for c in commands if c[0] == "git"], commands)
+        self.assertFalse([c for c in commands if "--rev" in c], commands)
+        self.assertNotIn("::warning", output)
+
+
+class TestPrHeadRev(unittest.TestCase):
+    def test_payload_head_sha_wins_when_the_clone_has_it(self):
+        with (
+            patch("main.get_pr_head_sha", return_value="abc123"),
+            patch(
+                "main.subprocess.run", return_value=MagicMock(returncode=0)
+            ) as mock_run,
+        ):
+            self.assertEqual(main.pr_head_rev(), "abc123")
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            ["git", "rev-parse", "--verify", "--quiet", "abc123^{commit}"],
+        )
+
+    def test_pull_request_falls_back_to_head2(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch(
+                "main.subprocess.run", return_value=MagicMock(returncode=0)
+            ) as mock_run,
+        ):
+            self.assertEqual(main.pr_head_rev(), "HEAD^2")
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD^2^{commit}"],
+        )
+
+    def test_pull_request_target_does_not_fall_back_to_head2(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch(
+                "main.subprocess.run", return_value=MagicMock(returncode=0)
+            ) as mock_run,
+        ):
+            self.assertIsNone(main.pr_head_rev())
+        mock_run.assert_not_called()
+
+    def test_unfetched_payload_sha_on_pull_request_target_returns_none(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}),
+            patch("main.get_pr_head_sha", return_value="abc123"),
+            patch("main.subprocess.run", return_value=MagicMock(returncode=1)),
+        ):
+            self.assertIsNone(main.pr_head_rev())
+
+    def test_shallow_clone_returns_none(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch("main.subprocess.run", return_value=MagicMock(returncode=1)),
+        ):
+            self.assertIsNone(main.pr_head_rev())
+
+    def test_missing_git_returns_none(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
+            patch("main.get_pr_head_sha", return_value=None),
+            patch("main.subprocess.run", side_effect=OSError("no git")),
+        ):
+            self.assertIsNone(main.pr_head_rev())
+
+
+class TestCheckoutHint(unittest.TestCase):
+    def test_pull_request_names_fetch_depth(self):
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}):
+            self.assertEqual(main.checkout_hint(), main.SHALLOW_CHECKOUT_HINT)
+
+    def test_pull_request_target_names_the_checkout(self):
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request_target"}):
+            self.assertEqual(main.checkout_hint(), main.TARGET_CHECKOUT_HINT)
+            self.assertIn("refs/pull/<number>/merge", main.checkout_hint())
+
+
+class TestGetPrHeadSha(unittest.TestCase):
+    def test_reads_the_head_sha_from_the_event(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"pull_request": {"head": {"sha": "abc123"}}}, f)
+            event_path = f.name
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "GITHUB_EVENT_NAME": "pull_request_target",
+                    "GITHUB_EVENT_PATH": event_path,
+                },
+            ):
+                self.assertEqual(main.get_pr_head_sha(), "abc123")
+        finally:
+            os.unlink(event_path)
+
+    def test_reads_the_base_sha_from_the_event(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"pull_request": {"base": {"sha": "base111"}}}, f)
+            event_path = f.name
+        try:
+            with patch.dict(
+                os.environ,
+                {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": event_path},
+            ):
+                self.assertEqual(main.get_pr_base_sha(), "base111")
+                self.assertIsNone(main.get_pr_head_sha())
+        finally:
+            os.unlink(event_path)
+
+    def test_not_a_pr_event_returns_none(self):
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "push"}):
+            self.assertIsNone(main.get_pr_head_sha())
+            self.assertIsNone(main.get_pr_base_sha())
+
+    def test_missing_event_path_returns_none(self):
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}):
+            os.environ.pop("GITHUB_EVENT_PATH", None)
+            self.assertIsNone(main.get_pr_head_sha())
+
+    def test_unreadable_event_returns_none(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_EVENT_PATH": "/nonexistent.json",
+            },
+        ):
+            self.assertIsNone(main.get_pr_head_sha())
+
+
+class TestCommitCheckVersionPin(unittest.TestCase):
+    """The warn rendering is inert against an engine that never emits it.
+
+    commit-check reports ``"status": "warn"`` from 2.17.0; the action pinned
+    2.16.0 for a release after shipping the rendering, so nobody could ever
+    see it. Both the installed package and the pin have to keep up.
+    """
+
+    MINIMUM = (2, 17, 0)
+
+    @staticmethod
+    def _parse(version: str) -> tuple[int, ...]:
+        match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+        assert match, f"unparsable commit-check version: {version!r}"
+        return tuple(int(part) for part in match.groups())
+
+    def test_installed_commit_check_can_report_warnings(self):
+        try:
+            version = importlib.metadata.version("commit-check")
+        except importlib.metadata.PackageNotFoundError:
+            self.skipTest("commit-check is not installed")
+        self.assertGreaterEqual(
+            self._parse(version),
+            self.MINIMUM,
+            f"installed commit-check {version} predates the warn status",
+        )
+
+    def test_requirements_pin_can_report_warnings(self):
+        here = os.path.dirname(os.path.abspath(main.__file__))
+        with open(os.path.join(here, "requirements.txt"), encoding="utf-8") as f:
+            pins = dict(
+                line.strip().split("==", 1)
+                for line in f
+                if "==" in line and not line.startswith("#")
+            )
+        self.assertGreaterEqual(self._parse(pins["commit-check"]), self.MINIMUM)
 
 
 class TestRenderStepLog(unittest.TestCase):
@@ -682,6 +1131,33 @@ class TestRenderStepLog(unittest.TestCase):
         self.assertNotIn("0 failures", output)
         self.assertIn("unexpected output", output)
         self.assertIn("::error title=commit-check: Branch::", output)
+
+    def test_dry_run_downgrades_annotations_and_prints_verdict(self):
+        """Dry-run still reports every failure, but nothing may say "error".
+
+        The exit code is forced to 0, so an ::error annotation would count
+        toward the run's error total on a green job, and log_error_and_exit
+        prints nothing for a zero exit — leaving the log with no verdict.
+        """
+        with patch("main.DRY_RUN_ENABLED", True):
+            output = self._run([fail_scope("Commit 1/1"), pass_scope("Branch")])
+        self.assertNotIn("::error", output)
+        self.assertIn(
+            "::warning title=CC001 message::Commit 1/1: The commit message should "
+            "follow Conventional Commits.",
+            output,
+        )
+        self.assertIn(
+            "commit-check (dry-run): 1 of 2 checks failed; not failing the job",
+            output,
+        )
+        self.assertNotIn("all checks passed", output)
+
+    def test_dry_run_without_failures_prints_the_usual_verdict(self):
+        with patch("main.DRY_RUN_ENABLED", True):
+            output = self._run([pass_scope("Branch")])
+        self.assertIn("✔ commit-check: all checks passed", output)
+        self.assertNotIn("dry-run", output)
 
 
 class TestRenderJobSummary(unittest.TestCase):
@@ -963,9 +1439,47 @@ class TestAddPrComments(unittest.TestCase):
             rc = main.add_pr_comments([pass_scope()])
         self.assertEqual(rc, 0)
 
+    def test_push_event_skips_comment_without_warning(self):
+        """A push has no PR to comment on, and that is not a problem.
+
+        It used to reach get_pr_number(), which raised, so every push run
+        with pr-comments enabled carried a "Unable to post PR comment"
+        warning annotation.
+        """
+        event_path = os.path.join(tempfile.mkdtemp(), "event.json")
+        with open(event_path, "w", encoding="utf-8") as f:
+            json.dump({"ref": "refs/heads/main", "pusher": {"name": "octocat"}}, f)
+        with (
+            patch("main.PR_COMMENTS_ENABLED", True),
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_EVENT_PATH": event_path,
+                    "GITHUB_TOKEN": "token",
+                    "GITHUB_REPOSITORY": "owner/repo",
+                },
+            ),
+            patch("main.get_pr_number") as mock_number,
+            patch("builtins.print") as mock_print,
+        ):
+            rc = main.add_pr_comments([fail_scope()])
+        self.assertEqual(rc, 0)
+        mock_number.assert_not_called()
+        printed = [
+            call[0][0]
+            for call in mock_print.call_args_list
+            if call[0] and isinstance(call[0][0], str)
+        ]
+        self.assertFalse(
+            [line for line in printed if line.startswith("::warning")], printed
+        )
+
     def test_fork_pr_skips_comment_and_warns(self):
         with (
             patch("main.PR_COMMENTS_ENABLED", True),
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
             patch("main.is_fork_pr", return_value=True),
             patch("main.JOB_SUMMARY_ENABLED", False),
             patch("builtins.print") as mock_print,
@@ -980,6 +1494,7 @@ class TestAddPrComments(unittest.TestCase):
         summary_path = os.path.join(tempfile.mkdtemp(), "summary.txt")
         with (
             patch("main.PR_COMMENTS_ENABLED", True),
+            patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}),
             patch("main.is_fork_pr", return_value=True),
             patch("main.JOB_SUMMARY_ENABLED", True),
             patch("main.GITHUB_STEP_SUMMARY", summary_path),
@@ -1010,6 +1525,7 @@ class TestAddPrComments(unittest.TestCase):
                 {
                     "GITHUB_TOKEN": "token",
                     "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_EVENT_NAME": "pull_request",
                     "GITHUB_REF": "refs/pull/12/merge",
                 },
             ),
@@ -1043,6 +1559,7 @@ class TestAddPrComments(unittest.TestCase):
                 {
                     "GITHUB_TOKEN": "token",
                     "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_EVENT_NAME": "pull_request",
                     "GITHUB_REF": "refs/pull/12/merge",
                 },
             ),
@@ -1073,6 +1590,7 @@ class TestAddPrComments(unittest.TestCase):
                 {
                     "GITHUB_TOKEN": "token",
                     "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_EVENT_NAME": "pull_request",
                     "GITHUB_REF": "refs/pull/12/merge",
                 },
             ),
@@ -1127,6 +1645,7 @@ class TestAddPrCommentsFailures(unittest.TestCase):
                 {
                     "GITHUB_TOKEN": "token",
                     "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_EVENT_NAME": "pull_request",
                     "GITHUB_REF": "refs/pull/12/merge",
                 },
             ),
@@ -1470,6 +1989,68 @@ class TestWarnedScopes(unittest.TestCase):
             ],
         )
         self.assertEqual(mixed.status, "fail")
+
+    def test_a_warning_survives_reporting_on_a_scope_that_also_fails(self):
+        """The scope's status names its worst outcome, but both findings
+        still belong on every surface: the count, both tables, and the
+        details block. Filtering any of those on ``scope.status == "warn"``
+        drops this scope's warning the moment its sibling rule fails.
+        """
+        mixed = main.ScopeResult(
+            label="Branch",
+            checks=[
+                make_check(
+                    "branch",
+                    status="warn",
+                    rule_id="CC201",
+                    value="jsmith/fix-x",
+                    error="The branch should follow Conventional Branch.",
+                    suggest="Use <type>/<description>",
+                    docs_url="https://commit-check.com/rules/#cc201",
+                ),
+                make_check(
+                    "merge_base",
+                    status="fail",
+                    rule_id="CC202",
+                    value="jsmith/fix-x",
+                    error="Current branch is not rebased onto main.",
+                    docs_url="https://commit-check.com/rules/#cc202",
+                ),
+            ],
+        )
+        self.assertEqual(main._warn_count([mixed]), 1)
+
+        body = main.render_report([mixed])
+        self.assertIn("❌ **1 of 1 check failed**, 1 warning", body)
+        self.assertIn("| Scope | Checked value | Failed checks |", body)
+        self.assertIn("[CC202 merge-base](https://commit-check.com/rules/#cc202)", body)
+        self.assertIn("| Scope | Checked value | Warnings |", body)
+        self.assertIn("[CC201 branch](https://commit-check.com/rules/#cc201)", body)
+        self.assertIn("  ✖ Branch (1 failure)", body)
+        self.assertIn("      CC202 merge-base", body)
+        self.assertIn("  ⚠ Branch (1 warning)", body)
+        self.assertIn("      CC201 branch", body)
+
+    def test_step_log_and_report_agree_on_a_mixed_scope(self):
+        """The step log's ::warning annotation must not be the only surface
+        that shows this scope's warning — the report has to as well."""
+        mixed = main.ScopeResult(
+            label="Branch",
+            checks=[
+                make_check("branch", status="warn", rule_id="CC201", error="e1"),
+                make_check("merge_base", status="fail", rule_id="CC202", error="e2"),
+            ],
+        )
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            main.render_step_log([mixed])
+        step_log = buf.getvalue()
+        self.assertIn("::warning title=CC201 branch::", step_log)
+        self.assertIn("::error title=CC202 merge-base::", step_log)
+
+        body = main.render_report([mixed])
+        self.assertIn("CC201 branch", body)
+        self.assertIn("CC202 merge-base", body)
 
     def test_a_warning_outranks_a_skip_in_the_same_scope(self):
         mixed = main.ScopeResult(

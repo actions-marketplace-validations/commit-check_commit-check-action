@@ -190,6 +190,140 @@ def is_pr_event() -> bool:
     return os.getenv("GITHUB_EVENT_NAME", "") in {"pull_request", "pull_request_target"}
 
 
+#: The one fix for every "history is too shallow" finding below.
+SHALLOW_CHECKOUT_HINT = "is actions/checkout using fetch-depth: 0?"
+
+#: On pull_request_target the default checkout is the base branch, which
+#: holds none of the pull request at any depth; the fix is to check the
+#: pull request out.
+TARGET_CHECKOUT_HINT = (
+    "is the workflow checking out the pull request, e.g. "
+    "ref: refs/pull/<number>/merge with fetch-depth: 0?"
+)
+
+
+def checkout_hint() -> str:
+    """The fix for a checkout that does not hold the pull request."""
+    if os.getenv("GITHUB_EVENT_NAME") == "pull_request_target":
+        return TARGET_CHECKOUT_HINT
+    return SHALLOW_CHECKOUT_HINT
+
+
+#: The pull request branch tip. On ``refs/pull/N/merge`` HEAD is a merge
+#: commit that GitHub authored, so its recorded author is
+#: ``GitHub <noreply@github.com>`` whatever the contributor configured;
+#: HEAD^2 is the commit the contributor actually made.
+PR_HEAD_REV = "HEAD^2"
+
+#: The checks whose subject is a commit's recorded author.
+AUTHOR_FLAGS = ("--author-name", "--author-email")
+
+
+def warn_shallow_checkout(problem: str, consequence: str) -> None:
+    """Annotate a PR run whose clone is too shallow to do what was asked.
+
+    ``actions/checkout`` defaults to ``fetch-depth: 1``, which leaves the
+    synthetic merge commit as the only commit in the clone. Every caller
+    hits that same root cause, so they share one message shape that names
+    the fix rather than only the symptom.
+    """
+    text = f"{problem} ({checkout_hint()}); {consequence}"
+    print(f"::warning title=commit-check::{_annotation_escape(text)}")
+
+
+def get_pr_event() -> dict[str, Any]:
+    """The ``pull_request`` object from the event payload, or ``{}``."""
+    if not is_pr_event():
+        return {}
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    if not event_path:
+        return {}
+    try:
+        with open(event_path, "r", encoding="utf-8") as f:
+            event = json.load(f)
+        return event.get("pull_request") or {}
+    except Exception as e:
+        print(f"::warning::Failed to read the PR from the event: {e}", file=sys.stderr)
+        return {}
+
+
+def get_pr_head_sha() -> str | None:
+    """The pull request's head commit, from the event payload."""
+    return get_pr_event().get("head", {}).get("sha") or None
+
+
+def get_pr_base_sha() -> str | None:
+    """The base branch tip the pull request targets, from the event payload."""
+    return get_pr_event().get("base", {}).get("sha") or None
+
+
+def _rev_resolves(rev: str) -> bool:
+    """Whether ``rev`` names a commit the clone actually has."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def pr_head_rev() -> str | None:
+    """The commit whose recorded author the PR's author checks read.
+
+    First choice is ``pull_request.head.sha`` from the event payload: it
+    names the branch tip for ``pull_request`` and ``pull_request_target``
+    alike, whatever was checked out, as long as the clone has it. Failing
+    that, ``HEAD^2`` on a ``pull_request`` checkout, where HEAD is the
+    merge ref and its second parent is that same tip. Never ``HEAD^2`` on
+    ``pull_request_target``: there HEAD is the base branch, so ``HEAD^2``
+    is nothing, or the parent of some unrelated merge on it.
+
+    ``None`` when the clone is too shallow to hold either.
+    """
+    sha = get_pr_head_sha()
+    if sha and _rev_resolves(sha):
+        return sha
+    if os.getenv("GITHUB_EVENT_NAME") == "pull_request" and _rev_resolves(PR_HEAD_REV):
+        return PR_HEAD_REV
+    return None
+
+
+#: The rule each author check runs, for a scope that had to be skipped.
+AUTHOR_RULES = {
+    "--author-name": ("CC101", "author_name"),
+    "--author-email": ("CC102", "author_email"),
+}
+
+
+def skipped_author_scope(flag: str) -> ScopeResult:
+    """A scope recording that an author check could not run at all.
+
+    Reported as ``skip``, never as a pass: nothing was validated, and the
+    one commit the clone does hold (HEAD) has the wrong author for a pull
+    request, GitHub's merge commit or the base branch.
+    """
+    rule_id, check = AUTHOR_RULES[flag]
+    return ScopeResult(
+        label=CHECK_LABELS[flag],
+        checks=[
+            {
+                "rule_id": rule_id,
+                "check": check,
+                "status": "skip",
+                "value": "",
+                "error": "",
+                "suggest": "",
+                "docs_url": "",
+            }
+        ],
+    )
+
+
 def get_pr_title() -> str | None:
     """Read PR title from GitHub event payload."""
     if not is_pr_event():
@@ -215,10 +349,10 @@ def parse_commit_messages(output: str) -> list[str]:
     ]
 
 
-def get_messages_from_merge_ref() -> list[str]:
-    """Read PR commit messages from GitHub's synthetic merge commit."""
+def _messages_in_range(revision_range: str) -> list[str]:
+    """Commit messages in ``revision_range``, oldest first, or ``[]``."""
     result = subprocess.run(
-        ["git", "log", "--pretty=format:%B%x00", "--reverse", "HEAD^1..HEAD^2"],
+        ["git", "log", "--pretty=format:%B%x00", "--reverse", revision_range],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         encoding="utf-8",
@@ -227,41 +361,59 @@ def get_messages_from_merge_ref() -> list[str]:
     if result.returncode == 0 and result.stdout:
         return parse_commit_messages(result.stdout)
     return []
+
+
+def get_messages_from_event_range() -> list[str]:
+    """Read PR commit messages between the payload's base and head commits.
+
+    ``pull_request.base.sha`` and ``pull_request.head.sha`` name the pull
+    request whatever the workflow checked out, for ``pull_request`` and
+    ``pull_request_target`` alike; the range is usable whenever the clone
+    holds both commits.
+    """
+    base_sha, head_sha = get_pr_base_sha(), get_pr_head_sha()
+    if not (base_sha and head_sha):
+        return []
+    if not (_rev_resolves(head_sha) and _rev_resolves(base_sha)):
+        return []
+    return _messages_in_range(f"{base_sha}..{head_sha}")
+
+
+def get_messages_from_merge_ref() -> list[str]:
+    """Read PR commit messages from GitHub's synthetic merge commit.
+
+    Only meaningful on a ``pull_request`` checkout, where HEAD is
+    ``refs/pull/N/merge``. On ``pull_request_target`` HEAD is the base
+    branch: ``HEAD^2`` is then nothing, or the parent of some unrelated
+    merge on it, whose commits are not the pull request's.
+    """
+    if os.getenv("GITHUB_EVENT_NAME") != "pull_request":
+        return []
+    return _messages_in_range("HEAD^1..HEAD^2")
 
 
 def get_messages_from_head_ref(base_ref: str) -> list[str]:
     """Read PR commit messages when the workflow checks out the head SHA."""
-    result = subprocess.run(
-        [
-            "git",
-            "log",
-            "--pretty=format:%B%x00",
-            "--reverse",
-            f"origin/{base_ref}..HEAD",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        check=False,
-    )
-    if result.returncode == 0 and result.stdout:
-        return parse_commit_messages(result.stdout)
-    return []
+    return _messages_in_range(f"origin/{base_ref}..HEAD")
 
 
 def get_pr_commit_messages() -> list[str]:
     """Get all commit messages for the current PR workflow.
 
-    In pull_request-style workflows, actions/checkout checks out a synthetic merge
-    commit (HEAD = merge of PR branch into base). HEAD^1 is the base branch
-    tip, HEAD^2 is the PR branch tip. So HEAD^1..HEAD^2 gives all PR commits.
-    If the workflow explicitly checks out the PR head SHA instead, fall back to
-    diffing against origin/<base-ref> when that ref is available locally.
+    The event payload's ``base.sha..head.sha`` is tried first: it names the
+    pull request exactly, whatever was checked out. On a ``pull_request``
+    checkout HEAD is the synthetic merge commit, so ``HEAD^1..HEAD^2`` is
+    the same range. If the workflow checks out the PR head SHA instead,
+    diff against ``origin/<base-ref>`` when that ref is available locally.
     """
     if not is_pr_event():
         return []
 
     try:
+        messages = get_messages_from_event_range()
+        if messages:
+            return messages
+
         messages = get_messages_from_merge_ref()
         if messages:
             return messages
@@ -323,13 +475,22 @@ def run_pr_message_checks(pr_messages: list[str]) -> list[ScopeResult]:
     return results
 
 
-def run_other_checks(args: list[str]) -> list[ScopeResult]:
-    """Run each non-message check (branch, author) once, as its own scope."""
+def run_other_checks(args: list[str], rev: str | None = None) -> list[ScopeResult]:
+    """Run each non-message check (branch, author) once, as its own scope.
+
+    ``rev`` goes to the author checks only: it names the commit whose
+    recorded author is validated (commit-check >= 2.16.0), which in a PR is
+    the branch tip rather than GitHub's merge commit. The branch check has
+    no commit to point at, so it never takes it.
+    """
     results: list[ScopeResult] = []
     for flag in args:
         label = CHECK_LABELS.get(flag)
         if label:
-            results.append(check_scope(label, [flag]))
+            cli_args = [flag]
+            if rev and flag in AUTHOR_FLAGS:
+                cli_args += ["--rev", rev]
+            results.append(check_scope(label, cli_args))
     return results
 
 
@@ -371,13 +532,36 @@ def run_commit_check() -> tuple[int, list[ScopeResult]]:
             # only validating the synthetic merge commit at HEAD.
             results.extend(run_pr_message_checks(pr_messages))
             args = [a for a in args if a != "--message"]
+        elif is_pr_event():
+            # Falling through to HEAD validates the synthetic merge commit,
+            # "Merge X into Y", which passes CC001 by default: a shallow
+            # clone used to turn every pull request green without a word.
+            warn_shallow_checkout(
+                "Could not list the pull request's commits", "only HEAD was checked"
+            )
 
     # ---- 3. Remaining checks (branch, author, etc.) -----------------------
     # Outside a PR, check the HEAD commit message directly.
     if "--message" in args:
         results.append(check_scope("Commit message", ["--message"]))
         args = [a for a in args if a != "--message"]
-    results.extend(run_other_checks(args))
+    rev = None
+    if is_pr_event() and any(flag in AUTHOR_FLAGS for flag in args):
+        rev = pr_head_rev()
+        if rev is None:
+            # HEAD's author is GitHub's merge commit on a pull_request
+            # checkout and the base branch on pull_request_target: checking
+            # it would grade the wrong person either way. Say so, and skip.
+            warn_shallow_checkout(
+                "Could not resolve the pull request's head commit for the "
+                "author checks",
+                "they were skipped",
+            )
+            for flag in args:
+                if flag in AUTHOR_FLAGS:
+                    results.append(skipped_author_scope(flag))
+            args = [a for a in args if a not in AUTHOR_FLAGS]
+    results.extend(run_other_checks(args, rev=rev))
 
     exit_code = exit_code_for(results)
     return exit_code, results
@@ -467,24 +651,26 @@ def _render_scopes(scopes: list[ScopeResult], include_docs: bool) -> list[str]:
             value = _scope_value(scope)
             lines.append(f"  ✔ {scope.label}{f' ({value})' if value else ''}")
             continue
-        if scope.status == "warn":
-            # Reported like a failure — same detail lines — but never a ✖:
-            # a warned rule ran and found something, it just does not fail
-            # the workflow, and the marker says so at a glance.
-            warnings = scope.warnings
-            count = f" ({len(warnings)} warning{'s' if len(warnings) != 1 else ''})"
-            lines.append(f"  ⚠ {scope.label}{count}")
-            lines.extend(_render_findings(warnings, include_docs))
-            continue
         if scope.raw_text and not scope.checks:
             # Defensive fallback: commit-check produced unexpected output.
             lines.append(f"  ✖ {scope.label}")
             lines.extend(f"      {ln}" for ln in scope.raw_text.strip().splitlines())
             continue
+        # A scope's status names its worst outcome (fail beats warn), but the
+        # two are not exclusive: CC2xx covers both branch and merge_base, so
+        # one can fail while the other only warns. Render whichever of the
+        # two lists is non-empty, rather than only the one the status names —
+        # a warning on an otherwise-failing scope is still a finding to fix.
         failures = scope.failures
-        count = f" ({len(failures)} failure{'s' if len(failures) != 1 else ''})"
-        lines.append(f"  ✖ {scope.label}{count}")
-        lines.extend(_render_findings(failures, include_docs))
+        if failures:
+            count = f" ({len(failures)} failure{'s' if len(failures) != 1 else ''})"
+            lines.append(f"  ✖ {scope.label}{count}")
+            lines.extend(_render_findings(failures, include_docs))
+        warnings = scope.warnings
+        if warnings:
+            count = f" ({len(warnings)} warning{'s' if len(warnings) != 1 else ''})"
+            lines.append(f"  ⚠ {scope.label}{count}")
+            lines.extend(_render_findings(warnings, include_docs))
     return lines
 
 
@@ -520,6 +706,11 @@ def render_step_log(results: list[ScopeResult]) -> None:
     A failure becomes an ``::error``, a warning a ``::warning`` \u2014 GitHub
     renders the two differently, and only the errors count toward the
     friendly one-line verdict claiming nothing failed.
+
+    Under ``dry-run`` a failure is still reported, but as a ``::warning``:
+    an ``::error`` annotation on a step that then exits 0 reads as a
+    contradiction, and the run's error count would claim a failure the job
+    did not have. The verdict line says the same thing in words.
     """
     # The tree is grouped, so it is printed group by group rather than in one
     # block: ::group:: and ::endgroup:: have to bracket each section's lines.
@@ -548,9 +739,10 @@ def render_step_log(results: list[ScopeResult]) -> None:
             first_line = error.splitlines()[0] if error else "check warning"
             warnings.append((_rule_label(check), f"{scope.label}: {first_line}"))
 
+    level = "warning" if DRY_RUN_ENABLED else "error"
     for title, message in errors:
         print(
-            f"::error title={_annotation_escape(title)}"
+            f"::{level} title={_annotation_escape(title)}"
             f"::{_annotation_escape(message)}"
         )
     for title, message in warnings:
@@ -559,6 +751,12 @@ def render_step_log(results: list[ScopeResult]) -> None:
             f"::{_annotation_escape(message)}"
         )
 
+    if errors and DRY_RUN_ENABLED:
+        failed, total = _check_counts(results)
+        print(
+            f"commit-check (dry-run): {failed} of {total} checks failed; "
+            "not failing the job"
+        )
     if not errors:
         skipped, warned, total = (
             _skip_count(results),
@@ -616,13 +814,15 @@ def _skip_count(results: list[ScopeResult]) -> int:
 
 
 def _warn_count(results: list[ScopeResult]) -> int:
-    """Number of scopes reported as warnings.
+    """Number of scopes that carry at least one warning.
 
-    Reported separately from the pass count, the same way skips are, so the
-    headline can say how many findings were surfaced without claiming they
-    failed anything.
+    Counts by ``scope.warnings``, not ``scope.status == "warn"``: a scope
+    whose overall status is "fail" (CC2xx covers both ``branch`` and
+    ``merge_base``, so one can fail while the other only warns) still has
+    warnings to report, and this is the count the verdict and the table use
+    to decide whether to show them.
     """
-    return sum(1 for scope in results if scope.status == "warn")
+    return sum(1 for scope in results if scope.warnings)
 
 
 def _markdown_table(
@@ -630,26 +830,32 @@ def _markdown_table(
 ) -> str:
     """Render the failure or warning table shared by summary and PR comment.
 
-    Only scopes of the given status appear, so a per-row result column would
-    read the same symbol on every row and carry no information; the pass/fail
-    picture for everything else lives in the details block.
+    A scope appears when it has an entry of the requested kind \u2014 checked via
+    ``scope.failures`` / ``scope.warnings``, not ``scope.status`` \u2014 so a scope
+    that both failed and warned gets a row in both tables. Filtering on the
+    scope's single overall status would silently drop its warnings once a
+    failure in the same scope outranked them.
     """
     rows = [
         f"| Scope | Checked value | {header} |",
         "|---|---|---|",
     ]
+    is_raw_only_failure = (
+        status == "fail"
+    )  # a raw-text scope has no checks to warn about
     for scope in results:
-        # A skipped scope has no failed checks and no checked value, so it
-        # contributed an entirely blank row \u2014 an empty accusation in a table
-        # headed "Failed checks" \u2014 before this filter existed.
-        if scope.status != status:
+        entries = scope.failures if status == "fail" else scope.warnings
+        raw_failure = is_raw_only_failure and scope.raw_text and not scope.checks
+        # A skipped or clean-passing scope has no matching entries and is not
+        # a raw-text failure, so it contributes no row \u2014 an empty accusation
+        # in a table headed "Failed checks" or "Warnings" otherwise.
+        if not entries and not raw_failure:
             continue
         value = _scope_value(scope)
         value_display = f"`{value}`" if value else "\u2014"
-        if scope.raw_text and not scope.checks:
+        if raw_failure:
             links = "_output could not be parsed \u2014 see details_"
         else:
-            entries = scope.failures if status == "fail" else scope.warnings
             links = " \u00b7 ".join(_rule_markdown_link(check) for check in entries)
         rows.append(f"| {scope.label} | {value_display} | {links} |")
     return "\n".join(rows)
@@ -1031,6 +1237,12 @@ def _find_own_comments(comments: list[Any]) -> tuple[Any | None, list[Any]]:
 def add_pr_comments(results: list[ScopeResult]) -> int:
     """Posts the commit check result as a comment on the pull request."""
     if not PR_COMMENTS_ENABLED:
+        return 0
+
+    # A push has no pull request to comment on. This used to fall through to
+    # get_pr_number(), which raised, and every push run carried a warning.
+    if not is_pr_event():
+        print("Skipping PR comment: not a pull request event.")
         return 0
 
     # Fork PRs triggered by the pull_request event receive a read-only token;
